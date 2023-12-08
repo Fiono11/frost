@@ -363,6 +363,7 @@ fn check_aggregate_invalid_share_identifier_for_verifying_shares<C: Ciphersuite 
 /// Test FROST signing with trusted dealer with a Ciphersuite.
 pub fn check_sign_with_dkg<C: Ciphersuite + PartialEq, R: RngCore + CryptoRng>(
     mut rng: R,
+    mut rng2: R,
 ) -> (Vec<u8>, Signature<C>, VerifyingKey<C>)
 where
     C::Group: std::cmp::PartialEq,
@@ -414,7 +415,7 @@ where
                 .expect("should be nonzero");
             received_round1_packages
                 .entry(receiver_participant_identifier)
-                .or_default()
+                .or_insert_with(BTreeMap::new)
                 .insert(participant_identifier, round1_package.clone());
         }
     }
@@ -470,12 +471,15 @@ where
     // In practice each participant will keep its copy; no one
     // will have all the participant's packages.
     let mut key_packages = BTreeMap::new();
+    let mut key_packages2 = BTreeMap::new();
 
     // Map of the verifying key of each participant.
     // Used by the signing test that follows.
     let mut verifying_keys = BTreeMap::new();
+    let mut verifying_keys2 = BTreeMap::new();
     // The group public key, used by the signing test that follows.
     let mut verifying_key = None;
+    let mut verifying_key2 = None;
     // For each participant, store the set of verifying keys they have computed.
     // This is used to check if the set is correct (the same) for all participants.
     // In practice, if there is a Coordinator, only they need to store the set.
@@ -483,6 +487,7 @@ where
     // The verifying keys are used to verify the signature shares produced
     // for each signature before being aggregated.
     let mut pubkey_packages_by_participant = BTreeMap::new();
+    let mut pubkey_packages_by_participant2 = BTreeMap::new();
 
     check_part3_different_participants(
         max_signers,
@@ -490,6 +495,40 @@ where
         received_round1_packages.clone(),
         received_round2_packages.clone(),
     );
+
+    let scalar = <<C::Group as Group>::Field>::one();
+    let element = <C::Group>::generator() * scalar;
+
+    let mut received_round1_packages2 = received_round1_packages.clone();
+
+    for (_, packages) in received_round1_packages2.iter_mut() {
+        for (_, package) in packages.iter_mut() {
+            // `element` is of type `Element<C>` as per your definition
+            // Assuming the `commitment` field can be accessed and modified here,
+            // and its first item is mutable.
+            if let Some(first_commitment) = package.commitment.0.first_mut() {
+                // Modify the first commitment by adding the `element` to it
+                // This assumes that `Element<C>` implements the `Add` trait,
+                // or has some method to perform addition.
+                first_commitment.0 = first_commitment.0 + element.clone();
+            }
+        }
+    }
+
+    let mut received_round2_packages2 = received_round2_packages.clone();
+    
+    for (_, packages) in received_round2_packages2.iter_mut() {
+        for (_, package) in packages.iter_mut() {
+            package.signing_share.0 = package.signing_share.0 + scalar.clone();
+        }
+    }
+    
+    let mut round2_secret_packages2 = round2_secret_packages.clone();
+
+    for (_, package) in round2_secret_packages2.iter_mut() {
+        package.commitment.0[0].0 = package.commitment.0[0].0 + element.clone();
+        package.secret_share = package.secret_share + scalar.clone();
+    }
 
     // For each participant, perform the third part of the DKG protocol.
     // In practice, each participant will perform this on their own environments.
@@ -510,6 +549,22 @@ where
         key_packages.insert(participant_identifier, key_package);
         pubkey_packages_by_participant
             .insert(participant_identifier, pubkey_package_for_participant);
+
+        let (key_package2, pubkey_package_for_participant2) = frost::keys::dkg::part3(
+                &round2_secret_packages2[&participant_identifier],
+                &received_round1_packages2[&participant_identifier],
+                &received_round2_packages2[&participant_identifier],
+            )
+            .unwrap();
+            verifying_keys2.insert(participant_identifier, key_package2.verifying_share);
+            // Test if all verifying_key are equal
+            if let Some(previous_verifying_key) = verifying_key2 {
+                assert_eq!(previous_verifying_key, key_package2.verifying_key)
+            }
+            verifying_key2 = Some(key_package2.verifying_key);
+            key_packages2.insert(participant_identifier, key_package2);
+            pubkey_packages_by_participant2
+                .insert(participant_identifier, pubkey_package_for_participant2);
     }
 
     // Test if the set of verifying keys is correct for all participants.
@@ -517,10 +572,16 @@ where
         assert!(verifying_keys_for_participant.verifying_shares == verifying_keys);
     }
 
+    for verifying_keys_for_participant2 in pubkey_packages_by_participant2.values() {
+        assert!(verifying_keys_for_participant2.verifying_shares == verifying_keys2);
+    }
+
     let pubkeys = frost::keys::PublicKeyPackage::new(verifying_keys, verifying_key.unwrap());
+    let pubkeys2 = frost::keys::PublicKeyPackage::new(verifying_keys2, verifying_key2.unwrap());
 
     // Proceed with the signing test.
-    check_sign(min_signers, key_packages, rng, pubkeys).unwrap()
+    check_sign(min_signers, key_packages, rng, pubkeys).unwrap();
+    check_sign(min_signers, key_packages2, rng2, pubkeys2).unwrap()
 }
 
 /// Check that calling dkg::part3() with distinct sets of participants fail.
@@ -825,3 +886,4 @@ pub fn check_sign_with_incorrect_commitments<C: Ciphersuite, R: RngCore + Crypto
     assert!(signature_share.is_err());
     assert!(signature_share == Err(Error::IncorrectCommitment))
 }
+
